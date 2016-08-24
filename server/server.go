@@ -897,6 +897,7 @@ func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, r
 				sub.Unlock()
 				return err
 			}
+			sub.ackSub.SetPendingLimits(-1, -1)
 		}
 		sub.Unlock()
 	}
@@ -1317,17 +1318,16 @@ func (s *StanServer) sendMsgToQueueGroup(qs *queueState, m *pb.MsgProto, force b
 		return nil, false
 	}
 	sub.Lock()
-	didSend := s.sendMsgToSub(sub, m, force)
+	didSend, sendMore := s.sendMsgToSub(sub, m, force)
 	lastSent := sub.LastSent
 	sub.Unlock()
-	if !didSend {
-		qs.stalled = true
-		return sub, false
-	}
-	if lastSent > qs.lastSent {
+	if didSend && lastSent > qs.lastSent {
 		qs.lastSent = lastSent
 	}
-	return sub, true
+	if !sendMore {
+		qs.stalled = true
+	}
+	return sub, sendMore
 }
 
 // processMsg will proces a message, and possibly send to clients, etc.
@@ -1511,9 +1511,9 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState) {
 // of acksPending is greater or equal to the sub's MaxInFlight limit, messages
 // are not sent and subscriber is marked as stalled.
 // Sub lock should be held before calling.
-func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) bool {
+func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) (bool, bool) {
 	if sub == nil || m == nil || (sub.newOnHold && !m.Redelivered) {
-		return false
+		return false, false
 	}
 
 	Tracef("STAN: [Client:%s] Sending msg subject=%s inbox=%s seqno=%d.",
@@ -1524,25 +1524,25 @@ func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) boo
 		sub.stalled = true
 		Debugf("STAN: [Client:%s] Stalled msgseq %s:%d to %s.",
 			sub.ClientID, m.Subject, m.Sequence, sub.Inbox)
-		return false
+		return false, false
 	}
 
 	b, _ := m.Marshal()
 	if err := s.nc.Publish(sub.Inbox, b); err != nil {
 		Errorf("STAN: [Client:%s] Failed Sending msgseq %s:%d to %s (%s).",
 			sub.ClientID, m.Subject, m.Sequence, sub.Inbox, err)
-		return false
+		return false, false
 	}
 
 	// If this message is already pending, nothing else to do.
 	if _, present := sub.acksPending[m.Sequence]; present {
-		return true
+		return true, true
 	}
 	// Store in storage
 	if err := sub.store.AddSeqPending(sub.ID, m.Sequence); err != nil {
 		Errorf("STAN: [Client:%s] Unable to update subscription for %s:%v (%v)",
 			sub.ClientID, m.Subject, m.Sequence, err)
-		return false
+		return false, false
 	}
 
 	// Update LastSent if applicable
@@ -1559,7 +1559,17 @@ func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) boo
 		sub.ackTimeFloor = m.Timestamp
 	}
 
-	return true
+	// Now that we have added to acksPending, check again if we
+	// have reached the max and tell the caller that it should not
+	// be sending more at this time.
+	if !force && (int32(len(sub.acksPending)) == sub.MaxInFlight) {
+		sub.stalled = true
+		Debugf("STAN: [Client:%s] Stalled msgseq %s:%d to %s.",
+			sub.ClientID, m.Subject, m.Sequence, sub.Inbox)
+		return true, false
+	}
+
+	return true, true
 }
 
 // Sets up the ackTimer to fire at the given duration.
@@ -2105,6 +2115,7 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 		sub.Unlock()
 		panic(fmt.Sprintf("Could not subscribe to ack subject, %v\n", err))
 	}
+	sub.ackSub.SetPendingLimits(-1, -1)
 	sub.Unlock()
 
 	// Create a non-error response
@@ -2202,7 +2213,7 @@ func (s *StanServer) sendAvailableMessagesToQueue(cs *stores.ChannelStore, qs *q
 		if nextMsg == nil {
 			break
 		}
-		if _, sent := s.sendMsgToQueueGroup(qs, nextMsg, honorMaxInFlight); !sent {
+		if _, sendMore := s.sendMsgToQueueGroup(qs, nextMsg, honorMaxInFlight); !sendMore {
 			break
 		}
 	}
@@ -2214,7 +2225,10 @@ func (s *StanServer) sendAvailableMessages(cs *stores.ChannelStore, sub *subStat
 	sub.Lock()
 	for nextSeq := sub.LastSent + 1; ; nextSeq++ {
 		nextMsg := cs.Msgs.Lookup(nextSeq)
-		if nextMsg == nil || s.sendMsgToSub(sub, nextMsg, honorMaxInFlight) == false {
+		if nextMsg == nil {
+			break
+		}
+		if sent, sendMore := s.sendMsgToSub(sub, nextMsg, honorMaxInFlight); !sent || !sendMore {
 			break
 		}
 	}
@@ -2302,7 +2316,7 @@ func (s *StanServer) ClusterID() string {
 
 // Shutdown will close our NATS connection and shutdown any embedded NATS server.
 func (s *StanServer) Shutdown() {
-	Debugf("STAN: Shutting down.")
+	Noticef("STAN: Shutting down.")
 
 	s.Lock()
 	if s.shutdown {
